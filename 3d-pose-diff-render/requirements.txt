@@ -1,0 +1,9 @@
+torch>=2.0.0
+torchvision
+mediapipe
+numpy
+scipy
+matplotlib
+opencv-python
+smplx
+iopath

@@ -1,0 +1,14 @@
+# Ignore dataset and heavy binaries
+data/
+*.pkl
+*.npz
+*.pt
+*.pth
+*.zip
+
+# Ignore Python & environment files
+__pycache__/
+*.pyc
+.env
+.venv/
+.ipynb_checkpoints/
