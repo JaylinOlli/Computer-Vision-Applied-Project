@@ -16,7 +16,8 @@ MediaPipe Pose + Differentiable-Rendering Pose Refinement. We will compare both 
 ## Compute: 
 The main computation will involve rendering the SMPL model, comparing the rendered image with the original, computing the loss, computing gradients via the differentiable renderer, and iteratively updating the pose parameters. 
 
-## Tools: ython, MediaPipe Pose, PyTorch, SMPL, PyTorch3D, or another differentiable rendering framework 
+## Tools: 
+Python, MediaPipe Pose, PyTorch, SMPL, PyTorch3D, or another differentiable rendering framework 
 GPU recommended 
 3DPW dataset 
 
