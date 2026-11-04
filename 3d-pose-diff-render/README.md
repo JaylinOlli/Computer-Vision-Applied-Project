@@ -1,6 +1,7 @@
 # Computer-Vision-Applied-Project Project title: Improving 3D Human Pose Estimation Using Differentiable Rendering
 Track: Differentiable Rendering; Analysis-by-synthesis pose refinement.
-Team: 1 
+
+### Team: 1 
 Members: Elif Bayrak, Ipule Pipi, Jabari Sterling, Jaylin Ollivierre
 
 ## Hypothesis: Optimizing MediaPipe's initial pose estimate via differentiable rendering will reduce the error between the estimated and ground-truth 3D poses.
