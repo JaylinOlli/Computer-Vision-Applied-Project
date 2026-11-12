@@ -11,10 +11,8 @@ MEDIAPIPE_JOINTS = [11, 12, 13, 14, 15, 16, 25, 26, 27, 28]
 
 def load_3dpw_sequence(dataset_path, split, sequence_name):
 
-    # Find the dataset file
+    # Find the dataset file and open
     file_path = os.path.join(dataset_path, split, sequence_name + ".pkl")
-
-    # Open the file
     with open(file_path, "rb") as f:
         data = pickle.load(f, encoding="latin1")
 
