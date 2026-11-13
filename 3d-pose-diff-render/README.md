@@ -35,15 +35,34 @@ Application: Can we use differentiable rendering to estimate an athlete’s 3D r
 
 ### Done: MediaPipe-to-SMPL initialization (`src/smpl_utils.py`)
 - **Correspondences and extraction:** MediaPipe 33-landmark to SMPL 24-joint table; `mediapipe_to_arrays()` reads world landmarks, pixels and visibility from either the legacy Solutions or the Tasks API result.
-- **Coordinate convention:** MediaPipe world landmarks are treated as camera-aligned (OpenCV: +X right, +Y down, +Z forward, meters). SMPL's different rest orientation is handled by `global_orient`, never by flipping axes.
+- **Coordinate convention:** MediaPipe world landmarks are treated as camera-aligned (OpenCV: +X right, +Y down, +Z forward, meters). SMPL's different rest orientation is handled by `global_orient`, never by flipping axes. Checked on a real photo (pixel/world correlations, left/right labels, nose and toes in front of the torso).
 - **Global orientation:** `torso_orientation_matrix()` builds a right-handed torso frame from the shoulders and hips; `global_orient_from_torso()` returns SMPL `global_orient` (axis-angle) that maps the SMPL rest torso onto the MediaPipe torso.
 - **SMPL forward model:** `load_smpl()` loads a Chumpy-free SMPL model (smplx), `smpl_forward()` returns vertices, 24 joints and faces with gradients preserved, and `smpl_rest_torso_orientation()` computes the rest-pose torso frame.
-- **Arm `body_pose`, Increment A:** `init_arm_pose()` sets the shoulder and elbow to the minimal (swing-only) rotations that match the observed upper-arm and forearm directions.
-- **Arm `body_pose`, Increment B:** `refine_arm_twist()` treats the elbow as a pure hinge about `elbow_hinge_axis()` and solves for shoulder twist from the elbow bend plane. Nearly straight arms (< 15 deg bend) fall back to Increment A.
+- **Limb `body_pose`, Increment A (swing-only):** `init_arm_pose()` / `init_leg_pose()` set the shoulder+elbow or hip+knee to the minimal rotations that match the observed bone directions (upper arm/forearm, thigh/shin). Rotation of a bone about its own axis (twist) is not estimated.
+- **Limb `body_pose`, Increment B (twist + hinge):** `refine_arm_twist()` / `refine_leg_twist()` treat the elbow/knee as a pure hinge about `elbow_hinge_axis()` / `knee_hinge_axis()` and solve the shoulder/hip twist jointly with the hinge angle from the bend plane. Bone directions stay exact. Elbows flex forward and knees flex backward (conventions checked on the official SMPL rest pose).
+  - Fallback to Increment A: arms bent < 15 deg, legs bent < 20 deg, or a hip twist above 60 deg (a sign of hyperextension or depth noise). All three limits are parameters.
+- Arms and legs share one implementation. `tests/golden/arm_golden.json` locks arm outputs to their pre-refactor values.
+
+### Public functions (`src/smpl_utils.py`)
+| Area | Functions |
+|---|---|
+| MediaPipe input | `mediapipe_to_arrays`, `mediapipe_world_to_camera_aligned`, `get_mediapipe_to_smpl_correspondence` |
+| Orientation | `torso_orientation_matrix`, `mediapipe_torso_orientation`, `smpl_torso_orientation_from_joints`, `global_orient_from_torso`, `rotation_angle_deg` |
+| Rotations / kinematics | `axis_angle_to_rotation_matrix`, `rotation_matrix_to_axis_angle`, `rotation_between_vectors`, `global_joint_rotations`, `SMPL_PARENTS` |
+| SMPL | `load_smpl`, `smpl_forward`, `smpl_rest_torso_orientation` |
+| Limbs | `init_arm_pose`, `refine_arm_twist`, `elbow_hinge_axis`, `init_leg_pose`, `refine_leg_twist`, `knee_hinge_axis` |
+
+Note: `refine_*_twist(world, rest_joints, global_orient, body_pose, side)` takes `body_pose` before `side` (unlike `init_*_pose`); pass both by keyword.
+
+### Known limitations
+- Twist is only resolved for clearly bent limbs; straight arms/legs keep the swing-only result (twist undetermined).
+- Hip twist of straight legs would need the foot direction, which requires an ankle model (not implemented). On the test photo, the foot yaw did not confirm the knee-plane hip twist (left leg: 8.2 deg with swing-only vs 14.4 deg with Increment B).
+- Single-frame MediaPipe depth is noisy; bends seen from the front (e.g. knees) mostly lie along the camera depth axis.
+- Joint-range limits are not enforced except for the hip-twist guard.
 
 ### Not done yet
-- Leg initialization (hips, knees, ankles)
-- Full-body `body_pose` initialization (spine, collar, neck, head, feet, hands are zero)
+- Full-body `body_pose`: spine, collars, neck, head, ankles/feet and wrists are still zero
+- A single full-body initializer function
 - Shape (`betas`) and camera translation estimation
 - Differentiable-rendering refinement on SMPL, 3DPW loading (`src/data_loader.py`) and metrics (`src/metrics.py`)
 
@@ -86,6 +105,7 @@ wget -O ~/models/mediapipe/pose_landmarker_heavy.task \
 ```
 
 The real-model checks in `test_smpl_model.py` are reported as `[skip]` unless `SMPL_MODEL_PATH` is set.
+With the model available, the suites currently report 67/67 (`test_smpl_utils.py`) and 25/25 (`test_smpl_model.py`).
 
 ## Real-image validation
 
@@ -96,9 +116,11 @@ Both scripts run MediaPipe on one photo, fit SMPL, and write their results to `-
 .venv/bin/python scripts/validate_global_orient.py --image photo.jpg \
     --smpl-model "$SMPL_MODEL_PATH" --out-dir ~/cv_outputs/orient [--mirror]
 
-# Arm pose, Increment A vs B: arm_metrics_<side>.json, arm_pose_3d_<side>.html
+# Limb pose, Increment A vs B: <prefix>_metrics_<side>.json, <prefix>_pose_3d_<side>.html
+# (prefix: arm | leg | limbs for --limbs arms | legs | all; default arms)
 .venv/bin/python scripts/validate_arm_pose.py --image photo.jpg \
-    --smpl-model "$SMPL_MODEL_PATH" --out-dir ~/cv_outputs/arm_pose [--side left|right|both]
+    --smpl-model "$SMPL_MODEL_PATH" --out-dir ~/cv_outputs/limb_pose \
+    [--limbs arms|legs|all] [--side left|right|both]
 ```
 
-The `.html` files are self-contained interactive Plotly views. Open them in any browser, for example with `xdg-open ~/cv_outputs/orient/orientation_3d.html`. On WSL, use `explorer.exe` with a Windows path. You can rotate and zoom the view and toggle individual traces. The arm view has an A / B / both dropdown, SMPL meshes and elbow hinge-axis arrows.
+The `.html` files are self-contained interactive Plotly views. Open them in any browser, for example with `xdg-open ~/cv_outputs/orient/orientation_3d.html`. On WSL, use `explorer.exe` with a Windows path. You can rotate and zoom the view and toggle individual traces. The limb view has an A / B / both dropdown, toggleable SMPL meshes, elbow/knee hinge-axis arrows and observed bend normals. For legs it also shows foot directions; `*_metrics_*.json` reports foot yaw and pitch separately (pitch differs by definition between SMPL's ankle->ball joint and MediaPipe's heel->toe, so only yaw is informative).

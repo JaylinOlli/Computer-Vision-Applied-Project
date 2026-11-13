@@ -764,12 +764,24 @@ def rotation_angle_deg(R_a, R_b, atol=1e-6):
 # the official model in tests/test_smpl_model.py.
 SMPL_PARENTS = (-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 21)
 
-# Arm landmarks / joints per side: (MediaPipe shoulder, elbow, wrist), (SMPL shoulder, elbow, wrist).
-_ARM_INDICES = {
-    side: (tuple(MEDIAPIPE_LANDMARK_NAMES.index(f"{side}_{j}") for j in ("shoulder", "elbow", "wrist")),
-           tuple(SMPL_JOINT_NAMES.index(f"{side}_{j}") for j in ("shoulder", "elbow", "wrist")))
-    for side in ("left", "right")
-}  # left: (11, 13, 15), (16, 18, 20); right: (12, 14, 16), (17, 19, 21)
+# Limb specifications. Bones point distally (proximal -> middle -> distal joint).
+#   flexion_sign: +1 -> flexion carries the distal bone FORWARD (elbow);
+#                 -1 -> flexion carries it BACKWARD (knee).
+_LIMB_SPECS = {
+    "arm": dict(joints=("shoulder", "elbow", "wrist"), upper="upper arm", lower="forearm",
+                flexion_sign=1.0),
+    "leg": dict(joints=("hip", "knee", "ankle"), upper="thigh", lower="shin",
+                flexion_sign=-1.0),
+}
+# (limb, side) -> ((MediaPipe proximal, middle, distal), (SMPL proximal, middle, distal))
+_LIMB_INDICES = {
+    (limb, side): (tuple(MEDIAPIPE_LANDMARK_NAMES.index(f"{side}_{j}") for j in spec["joints"]),
+                   tuple(SMPL_JOINT_NAMES.index(f"{side}_{j}") for j in spec["joints"]))
+    for limb, spec in _LIMB_SPECS.items() for side in ("left", "right")
+}
+# arm left: (11, 13, 15), (16, 18, 20); arm right: (12, 14, 16), (17, 19, 21)
+# leg left: (23, 25, 27), (1, 4, 7);    leg right: (24, 26, 28), (2, 5, 8)
+_ARM_INDICES = {side: _LIMB_INDICES[("arm", side)] for side in ("left", "right")}
 
 
 def _as_vec3(v, name, min_length=None):
@@ -877,6 +889,64 @@ def global_joint_rotations(global_orient, body_pose):
     return Q
 
 
+def _check_rest_joints(rest_joints):
+    J = np.asarray(rest_joints)
+    if J.dtype.kind not in "fiu" or J.shape != (NUM_SMPL_JOINTS, 3) or not np.isfinite(J).all():
+        raise ValueError(f"rest_joints must be a finite real ({NUM_SMPL_JOINTS}, 3) array")
+    return J.astype(np.float64)
+
+
+def _init_limb_swing(limb, world, rest_joints, global_orient, side, body_pose, min_bone_length):
+    """Shared Increment A (swing-only) for one limb. See init_arm_pose / init_leg_pose."""
+    if side not in ("left", "right"):
+        raise ValueError(f"side must be 'left' or 'right', got {side!r}")
+    spec = _LIMB_SPECS[limb]
+    prox, mid, _ = spec["joints"]
+    w = mediapipe_world_to_camera_aligned(world).astype(np.float64)
+    J = _check_rest_joints(rest_joints)
+    go = _as_vec3(global_orient, "global_orient")
+    bp = np.zeros(3 * (NUM_SMPL_JOINTS - 1)) if body_pose is None else _check_body_pose(body_pose).copy()
+
+    (m_s, m_e, m_w), (s_s, s_e, s_w) = _LIMB_INDICES[(limb, side)]
+
+    def unit(v, name):
+        return _as_vec3(v, name, min_bone_length) / np.linalg.norm(v)
+
+    d_upper = unit(w[m_e] - w[m_s], f"MediaPipe {side} {spec['upper']}")
+    d_fore = unit(w[m_w] - w[m_e], f"MediaPipe {side} {spec['lower']}")
+    b_upper = unit(J[s_e] - J[s_s], f"SMPL rest {side} {spec['upper']}")
+    b_fore = unit(J[s_w] - J[s_e], f"SMPL rest {side} {spec['lower']}")
+    fallback = smpl_torso_orientation_from_joints(J)[:, 2]  # rest torso forward
+
+    Q_parent = global_joint_rotations(go, bp)[SMPL_PARENTS[s_s]]
+    R_s = rotation_between_vectors(b_upper, Q_parent.T @ d_upper, fallback_axis=fallback)
+    bp[3 * (s_s - 1): 3 * s_s] = rotation_matrix_to_axis_angle(R_s)
+
+    Q_s = Q_parent @ axis_angle_to_rotation_matrix(bp[3 * (s_s - 1): 3 * s_s])
+    R_e = rotation_between_vectors(b_fore, Q_s.T @ d_fore, fallback_axis=fallback)
+    bp[3 * (s_e - 1): 3 * s_e] = rotation_matrix_to_axis_angle(R_e)
+
+    r_e = bp[3 * (s_e - 1): 3 * s_e]
+    hinge_rest = np.cross(b_upper, fallback if spec["flexion_sign"] > 0 else -fallback)
+    hinge_rest /= np.linalg.norm(hinge_rest)
+    e_angle = float(np.linalg.norm(r_e))
+    diagnostics = {
+        f"{prox}_rotation_deg": math.degrees(float(np.linalg.norm(bp[3 * (s_s - 1): 3 * s_s]))),
+        f"{mid}_rotation_deg": math.degrees(e_angle),
+        f"{mid}_bend_mediapipe_deg": math.degrees(math.atan2(np.linalg.norm(np.cross(d_upper, d_fore)),
+                                                             d_upper @ d_fore)),
+        # Diagnostic only (no constraint): angle between the middle joint's rotation
+        # axis and the rest flexion axis unit(b_upper x (+/-)forward). ~0 = flexion,
+        # ~180 = bend the other way, ~90 = off-hinge. None if the joint is ~straight.
+        f"{mid}_axis_vs_flexion_axis_deg": (
+            math.degrees(math.acos(float(np.clip((r_e / e_angle) @ hinge_rest, -1.0, 1.0))))
+            if e_angle > 1e-6 else None),
+        f"{prox}_body_pose_slice": (3 * (s_s - 1), 3 * s_s),
+        f"{mid}_body_pose_slice": (3 * (s_e - 1), 3 * s_e),
+    }
+    return bp, diagnostics
+
+
 def init_arm_pose(world, rest_joints, global_orient, side="left", body_pose=None,
                   min_bone_length=1e-6):
     """
@@ -909,58 +979,24 @@ def init_arm_pose(world, rest_joints, global_orient, side="left", body_pose=None
     Returns:
         (body_pose (69,) float64, diagnostics dict)
     """
-    if side not in _ARM_INDICES:
-        raise ValueError(f"side must be 'left' or 'right', got {side!r}")
-    w = mediapipe_world_to_camera_aligned(world).astype(np.float64)
-    J = np.asarray(rest_joints)
-    if J.dtype.kind not in "fiu" or J.shape != (NUM_SMPL_JOINTS, 3) or not np.isfinite(J).all():
-        raise ValueError(f"rest_joints must be a finite real ({NUM_SMPL_JOINTS}, 3) array")
-    J = J.astype(np.float64)
-    go = _as_vec3(global_orient, "global_orient")
-    bp = np.zeros(3 * (NUM_SMPL_JOINTS - 1)) if body_pose is None else _check_body_pose(body_pose).copy()
+    return _init_limb_swing("arm", world, rest_joints, global_orient, side, body_pose, min_bone_length)
 
-    (m_s, m_e, m_w), (s_s, s_e, s_w) = _ARM_INDICES[side]
 
-    def unit(v, name):
-        return _as_vec3(v, name, min_bone_length) / np.linalg.norm(v)
-
-    d_upper = unit(w[m_e] - w[m_s], f"MediaPipe {side} upper arm")
-    d_fore = unit(w[m_w] - w[m_e], f"MediaPipe {side} forearm")
-    b_upper = unit(J[s_e] - J[s_s], f"SMPL rest {side} upper arm")
-    b_fore = unit(J[s_w] - J[s_e], f"SMPL rest {side} forearm")
-    fallback = smpl_torso_orientation_from_joints(J)[:, 2]  # rest torso forward
-
-    Q_parent = global_joint_rotations(go, bp)[SMPL_PARENTS[s_s]]
-    R_s = rotation_between_vectors(b_upper, Q_parent.T @ d_upper, fallback_axis=fallback)
-    bp[3 * (s_s - 1): 3 * s_s] = rotation_matrix_to_axis_angle(R_s)
-
-    Q_s = Q_parent @ axis_angle_to_rotation_matrix(bp[3 * (s_s - 1): 3 * s_s])
-    R_e = rotation_between_vectors(b_fore, Q_s.T @ d_fore, fallback_axis=fallback)
-    bp[3 * (s_e - 1): 3 * s_e] = rotation_matrix_to_axis_angle(R_e)
-
-    r_e = bp[3 * (s_e - 1): 3 * s_e]
-    hinge_rest = np.cross(b_upper, fallback)
-    hinge_rest /= np.linalg.norm(hinge_rest)
-    e_angle = float(np.linalg.norm(r_e))
-    diagnostics = {
-        "shoulder_rotation_deg": math.degrees(float(np.linalg.norm(bp[3 * (s_s - 1): 3 * s_s]))),
-        "elbow_rotation_deg": math.degrees(e_angle),
-        "elbow_bend_mediapipe_deg": math.degrees(math.atan2(np.linalg.norm(np.cross(d_upper, d_fore)),
-                                                            d_upper @ d_fore)),
-        # Diagnostic only (no constraint): angle between the elbow's rotation axis
-        # and the rest "forward-flexion" axis unit(b_upper x forward). ~0 = forward
-        # flexion, ~180 = backward bend, ~90 = off-hinge. None if elbow ~straight.
-        "elbow_axis_vs_flexion_axis_deg": (
-            math.degrees(math.acos(float(np.clip((r_e / e_angle) @ hinge_rest, -1.0, 1.0))))
-            if e_angle > 1e-6 else None),
-        "shoulder_body_pose_slice": (3 * (s_s - 1), 3 * s_s),
-        "elbow_body_pose_slice": (3 * (s_e - 1), 3 * s_e),
-    }
-    return bp, diagnostics
+def init_leg_pose(world, rest_joints, global_orient, side="left", body_pose=None,
+                  min_bone_length=1e-6):
+    """
+    Swing-only initialisation of one leg's hip and knee local rotations
+    (same method as init_arm_pose; MediaPipe hip/knee/ankle 23/25/27 (left) or
+    24/26/28 (right) <-> SMPL hip/knee/ankle 1/4/7 or 2/5/8). The hip's parent
+    is the pelvis (root), so its parent frame is rodrigues(global_orient).
+    Hip twist about the thigh is NOT estimated. Only this leg's hip and knee
+    entries of body_pose change.
+    """
+    return _init_limb_swing("leg", world, rest_joints, global_orient, side, body_pose, min_bone_length)
 
 
 # --------------------------------------------------------------------------- #
-# Increment B: shoulder twist from the elbow bend plane, elbow as a pure hinge
+# Increment B: proximal twist from the bend plane, middle joint as a pure hinge
 # --------------------------------------------------------------------------- #
 def _signed_angle(a, b, axis):
     """Signed angle (radians) from a to b about `axis` (a, b roughly perpendicular to axis)."""
@@ -974,6 +1010,35 @@ def _off_hinge_deg(r, h):
         return 0.0
     perp = r - (r @ h) * h
     return math.degrees(math.asin(min(1.0, float(np.linalg.norm(perp)) / n)))
+
+
+def _twist_about_axis_deg(R, axis):
+    """Twist angle (degrees, in (-180, 180]) of R about unit `axis` (swing-twist decomposition R = S @ T_axis)."""
+    r = rotation_matrix_to_axis_angle(R)
+    theta = float(np.linalg.norm(r))
+    if theta < 1e-12:
+        return 0.0
+    tau = 2.0 * math.atan2(math.sin(theta / 2.0) * float((r / theta) @ axis), math.cos(theta / 2.0))
+    tau = (tau + math.pi) % (2.0 * math.pi) - math.pi
+    return math.degrees(tau)
+
+
+def _limb_hinge_axis(limb, rest_joints, side):
+    """h = unit(b1 x (flexion_sign * f_perp)); see elbow_hinge_axis / knee_hinge_axis."""
+    if side not in ("left", "right"):
+        raise ValueError(f"side must be 'left' or 'right', got {side!r}")
+    spec = _LIMB_SPECS[limb]
+    J = _check_rest_joints(rest_joints)
+    _, (s_s, s_e, _) = _LIMB_INDICES[(limb, side)]
+    b1 = _as_vec3(J[s_e] - J[s_s], f"SMPL rest {side} {spec['upper']}", 1e-6)
+    b1 = b1 / np.linalg.norm(b1)
+    f = smpl_torso_orientation_from_joints(J)[:, 2]
+    f_perp = f - (f @ b1) * b1
+    if np.linalg.norm(f_perp) < 1e-6:
+        raise ValueError(f"rest {side} {spec['upper']} is parallel to the torso forward axis")
+    f_dir = f_perp / np.linalg.norm(f_perp)
+    h = np.cross(b1, f_dir if spec["flexion_sign"] > 0 else -f_dir)
+    return h / np.linalg.norm(h)
 
 
 def elbow_hinge_axis(rest_joints, side):
@@ -991,21 +1056,115 @@ def elbow_hinge_axis(rest_joints, side):
     roughly down for the left arm and up for the right arm; the same formula
     serves both sides.
     """
-    if side not in _ARM_INDICES:
-        raise ValueError(f"side must be 'left' or 'right', got {side!r}")
-    J = np.asarray(rest_joints)
-    if J.dtype.kind not in "fiu" or J.shape != (NUM_SMPL_JOINTS, 3) or not np.isfinite(J).all():
-        raise ValueError(f"rest_joints must be a finite real ({NUM_SMPL_JOINTS}, 3) array")
-    J = J.astype(np.float64)
-    _, (s_s, s_e, _) = _ARM_INDICES[side]
-    b1 = _as_vec3(J[s_e] - J[s_s], f"SMPL rest {side} upper arm", 1e-6)
-    b1 = b1 / np.linalg.norm(b1)
-    f = smpl_torso_orientation_from_joints(J)[:, 2]
-    f_perp = f - (f @ b1) * b1
-    if np.linalg.norm(f_perp) < 1e-6:
-        raise ValueError(f"rest {side} upper arm is parallel to the torso forward axis")
-    h = np.cross(b1, f_perp / np.linalg.norm(f_perp))
-    return h / np.linalg.norm(h)
+    return _limb_hinge_axis("arm", rest_joints, side)
+
+
+def knee_hinge_axis(rest_joints, side):
+    """
+    Reference knee flexion axis h (3,) in SMPL model coordinates, from the rest geometry.
+
+        h = unit(b1 x (-f_perp)),  b1 = unit(J_knee - J_hip) (rest thigh, pointing down)
+
+    Convention: knee flexion carries the shin BACKWARD (posteriorly): a positive
+    rotation about h moves b1 toward -f_perp. Both thighs point down, so h is
+    roughly +x (the person's left) for BOTH legs. On the official model the rest
+    feet point forward (ankle->foot along the torso forward axis ~0.85-0.89),
+    which confirms the leg's anterior direction.
+    """
+    return _limb_hinge_axis("leg", rest_joints, side)
+
+
+def _refine_limb_twist(limb, world, rest_joints, global_orient, body_pose, side,
+                       straight_deg, straight_name, max_twist_deg, min_bone_length):
+    """Shared Increment B. See refine_arm_twist / refine_leg_twist."""
+    if not 0.0 < straight_deg < 90.0:
+        raise ValueError(f"{straight_name} must be in (0, 90), got {straight_deg!r}")
+    if max_twist_deg is not None and not 0.0 < max_twist_deg <= 180.0:
+        raise ValueError(f"max twist must be in (0, 180], got {max_twist_deg!r}")
+    spec = _LIMB_SPECS[limb]
+    prox, mid, _ = spec["joints"]
+    bp_A, diag_A = _init_limb_swing(limb, world, rest_joints, global_orient, side, body_pose, min_bone_length)
+    w = mediapipe_world_to_camera_aligned(world).astype(np.float64)
+    J = np.asarray(rest_joints, dtype=np.float64)
+    go = _as_vec3(global_orient, "global_orient")
+    (m_s, m_e, m_w), (s_s, s_e, s_w) = _LIMB_INDICES[(limb, side)]
+    sl_s, sl_e = slice(3 * (s_s - 1), 3 * s_s), slice(3 * (s_e - 1), 3 * s_e)
+
+    d1 = w[m_e] - w[m_s]
+    d1 = d1 / np.linalg.norm(d1)
+    d2 = w[m_w] - w[m_e]
+    d2 = d2 / np.linalg.norm(d2)
+    b1 = (J[s_e] - J[s_s]) / np.linalg.norm(J[s_e] - J[s_s])
+    b2 = (J[s_w] - J[s_e]) / np.linalg.norm(J[s_w] - J[s_e])
+    h = _limb_hinge_axis(limb, J, side)
+
+    cross12 = np.cross(d1, d2)
+    beta = math.atan2(float(np.linalg.norm(cross12)), float(d1 @ d2))
+    b2_perp = b2 - (b2 @ h) * h
+    cos_alpha = float(np.linalg.norm(b2_perp))
+    phi0 = _signed_angle(b1, b2_perp / cos_alpha, h)
+
+    diag = {
+        "bend_deg": math.degrees(beta),
+        f"{spec['lower']}_out_of_hinge_plane_deg": math.degrees(math.acos(min(1.0, cos_alpha))),
+        "phi0_rest_deg": math.degrees(phi0),
+        "off_hinge_swing_only_deg": _off_hinge_deg(bp_A[sl_e], h),
+        f"{prox}_body_pose_slice": diag_A[f"{prox}_body_pose_slice"],
+        f"{mid}_body_pose_slice": diag_A[f"{mid}_body_pose_slice"],
+    }
+    if max_twist_deg is not None:
+        # Leg-only diagnostics: twist limit, and whether the distal bone bends backward
+        # (+, knee-flexion-like) or forward (-, hyperextension-like) w.r.t. the torso.
+        f_cam = axis_angle_to_rotation_matrix(go) @ smpl_torso_orientation_from_joints(J)[:, 2]
+        ax = np.cross(d1, spec["flexion_sign"] * f_cam)  # rotating d1 toward the flexion side is +
+        diag["max_twist_deg"] = max_twist_deg
+        diag["bend_direction_deg"] = (math.degrees(_signed_angle(d1, d2, ax / np.linalg.norm(ax)))
+                                      if np.linalg.norm(ax) > 1e-6 else None)
+        diag["twist_deg"] = None
+
+    def unresolved(reason):
+        diag.update(twist_resolved=False, reason=reason, psi_deg=None, phi_deg=None,
+                    hinge_vs_bend_normal_deg=None, off_hinge_deg=diag["off_hinge_swing_only_deg"],
+                    phi_plausible=None)
+        return bp_A, diag
+
+    if math.sin(beta) < math.sin(math.radians(straight_deg)):
+        return unresolved(f"bend plane ill-defined ({limb} nearly straight or fully folded)")
+    c = math.cos(beta) / cos_alpha
+    if abs(c) > 1.0:
+        return unresolved(f"bend smaller than the rest {spec['lower']}'s out-of-hinge-plane offset")
+
+    phi = math.acos(c) - phi0
+    Q_parent = global_joint_rotations(go, bp_A)[SMPL_PARENTS[s_s]]
+    R_A = axis_angle_to_rotation_matrix(bp_A[sl_s])
+    t = (Q_parent @ R_A).T @ d2
+    v = axis_angle_to_rotation_matrix(phi * h) @ b2
+    v_p, t_p = v - (v @ b1) * b1, t - (t @ b1) * b1
+    psi = _signed_angle(v_p / np.linalg.norm(v_p), t_p / np.linalg.norm(t_p), b1)
+
+    R_s = R_A @ axis_angle_to_rotation_matrix(psi * b1)
+    if max_twist_deg is not None:
+        tau = _twist_about_axis_deg(R_s, b1)
+        diag["twist_deg"] = tau
+        if abs(tau) > max_twist_deg:
+            return unresolved(f"implausible {prox} twist {tau:.1f} deg (> {max_twist_deg} deg; "
+                              "possible hyperextension or depth noise)")
+
+    bp = bp_A.copy()
+    bp[sl_s] = rotation_matrix_to_axis_angle(R_s)
+    bp[sl_e] = phi * h
+    Q_s = Q_parent @ axis_angle_to_rotation_matrix(bp[sl_s])
+    hb = Q_s @ h
+    n = cross12 / np.linalg.norm(cross12)
+    diag.update(
+        twist_resolved=True, reason=None,
+        psi_deg=math.degrees(psi), phi_deg=math.degrees(phi),
+        # Expected ~asin(sin(alpha)/sin(beta)) because the rest distal bone is not in the hinge plane.
+        hinge_vs_bend_normal_deg=math.degrees(math.atan2(float(np.linalg.norm(np.cross(hb, n))), float(hb @ n))),
+        off_hinge_deg=_off_hinge_deg(bp[sl_e], h),
+        phi_plausible=bool(-10.0 <= math.degrees(phi) <= 150.0),
+    )
+    return bp, diag
 
 
 def refine_arm_twist(world, rest_joints, global_orient, body_pose=None, side="left",
@@ -1035,71 +1194,28 @@ def refine_arm_twist(world, rest_joints, global_orient, body_pose=None, side="le
         (body_pose (69,), diagnostics dict). Only this arm's shoulder and elbow
         entries differ from the input body_pose; the input is not modified.
     """
-    if not 0.0 < straight_arm_deg < 90.0:
-        raise ValueError(f"straight_arm_deg must be in (0, 90), got {straight_arm_deg!r}")
-    bp_A, diag_A = init_arm_pose(world, rest_joints, global_orient, side=side,
-                                 body_pose=body_pose, min_bone_length=min_bone_length)
-    w = mediapipe_world_to_camera_aligned(world).astype(np.float64)
-    J = np.asarray(rest_joints, dtype=np.float64)
-    go = _as_vec3(global_orient, "global_orient")
-    (m_s, m_e, m_w), (s_s, s_e, s_w) = _ARM_INDICES[side]
-    sl_s, sl_e = slice(3 * (s_s - 1), 3 * s_s), slice(3 * (s_e - 1), 3 * s_e)
+    return _refine_limb_twist("arm", world, rest_joints, global_orient, body_pose, side,
+                              straight_arm_deg, "straight_arm_deg", None, min_bone_length)
 
-    d1 = w[m_e] - w[m_s]
-    d1 = d1 / np.linalg.norm(d1)
-    d2 = w[m_w] - w[m_e]
-    d2 = d2 / np.linalg.norm(d2)
-    b1 = (J[s_e] - J[s_s]) / np.linalg.norm(J[s_e] - J[s_s])
-    b2 = (J[s_w] - J[s_e]) / np.linalg.norm(J[s_w] - J[s_e])
-    h = elbow_hinge_axis(J, side)
 
-    cross12 = np.cross(d1, d2)
-    beta = math.atan2(float(np.linalg.norm(cross12)), float(d1 @ d2))
-    b2_perp = b2 - (b2 @ h) * h
-    cos_alpha = float(np.linalg.norm(b2_perp))
-    phi0 = _signed_angle(b1, b2_perp / cos_alpha, h)
+def refine_leg_twist(world, rest_joints, global_orient, body_pose=None, side="left",
+                     straight_leg_deg=20.0, max_hip_twist_deg=60.0, min_bone_length=1e-6):
+    """
+    Increment B for one leg: hip twist from the knee bend plane, knee as a PURE
+    hinge about knee_hinge_axis() (flexion carries the shin backward). Same joint
+    solve as refine_arm_twist; thigh and shin directions match exactly.
 
-    diag = {
-        "bend_deg": math.degrees(beta),
-        "forearm_out_of_hinge_plane_deg": math.degrees(math.acos(min(1.0, cos_alpha))),
-        "phi0_rest_deg": math.degrees(phi0),
-        "off_hinge_swing_only_deg": _off_hinge_deg(bp_A[sl_e], h),
-        "shoulder_body_pose_slice": diag_A["shoulder_body_pose_slice"],
-        "elbow_body_pose_slice": diag_A["elbow_body_pose_slice"],
-    }
-
-    def unresolved(reason):
-        diag.update(twist_resolved=False, reason=reason, psi_deg=None, phi_deg=None,
-                    hinge_vs_bend_normal_deg=None, off_hinge_deg=diag["off_hinge_swing_only_deg"],
-                    phi_plausible=None)
-        return bp_A, diag
-
-    if math.sin(beta) < math.sin(math.radians(straight_arm_deg)):
-        return unresolved("bend plane ill-defined (arm nearly straight or fully folded)")
-    c = math.cos(beta) / cos_alpha
-    if abs(c) > 1.0:
-        return unresolved("bend smaller than the rest forearm's out-of-hinge-plane offset")
-
-    phi = math.acos(c) - phi0
-    Q_parent = global_joint_rotations(go, bp_A)[SMPL_PARENTS[s_s]]
-    R_A = axis_angle_to_rotation_matrix(bp_A[sl_s])
-    t = (Q_parent @ R_A).T @ d2
-    v = axis_angle_to_rotation_matrix(phi * h) @ b2
-    v_p, t_p = v - (v @ b1) * b1, t - (t @ b1) * b1
-    psi = _signed_angle(v_p / np.linalg.norm(v_p), t_p / np.linalg.norm(t_p), b1)
-
-    bp = bp_A.copy()
-    bp[sl_s] = rotation_matrix_to_axis_angle(R_A @ axis_angle_to_rotation_matrix(psi * b1))
-    bp[sl_e] = phi * h
-    Q_s = Q_parent @ axis_angle_to_rotation_matrix(bp[sl_s])
-    hb = Q_s @ h
-    n = cross12 / np.linalg.norm(cross12)
-    diag.update(
-        twist_resolved=True, reason=None,
-        psi_deg=math.degrees(psi), phi_deg=math.degrees(phi),
-        # Expected ~asin(sin(alpha)/sin(beta)) because the rest forearm is not in the hinge plane.
-        hinge_vs_bend_normal_deg=math.degrees(math.atan2(float(np.linalg.norm(np.cross(hb, n))), float(hb @ n))),
-        off_hinge_deg=_off_hinge_deg(bp[sl_e], h),
-        phi_plausible=bool(-10.0 <= math.degrees(phi) <= 150.0),
-    )
-    return bp, diag
+    Falls back to the swing-only result (init_leg_pose), with
+    diagnostics["twist_resolved"] = False, when
+      - sin(bend) < sin(straight_leg_deg)  (default 20 deg; the knee's rest shin is
+        ~7-8 deg out of the hinge plane, so small bends are noise-sensitive), or
+      - |hip twist| > max_hip_twist_deg  (default 60 deg; swing-twist decomposition
+        about the rest thigh). A forced flexion on a hyperextended or depth-noisy
+        knee shows up as a large hip twist.
+    Extra diagnostics: twist_deg (hip twist), bend_direction_deg (+: shin bends
+    backward relative to the torso, flexion-like; -: forward, hyperextension-like).
+    bend_direction_deg is only meaningful while the thigh points roughly down
+    (it is measured against the torso's forward axis); it is not used by any guard.
+    """
+    return _refine_limb_twist("leg", world, rest_joints, global_orient, body_pose, side,
+                              straight_leg_deg, "straight_leg_deg", max_hip_twist_deg, min_bone_length)

@@ -43,8 +43,12 @@ from src.smpl_utils import (  # noqa: E402
     elbow_hinge_axis,
     global_orient_from_torso,
     init_arm_pose,
+    init_leg_pose,
+    knee_hinge_axis,
     load_smpl,
     refine_arm_twist,
+    refine_leg_twist,
+    rotation_between_vectors,
     rotation_matrix_to_axis_angle,
     smpl_forward,
     smpl_rest_torso_orientation,
@@ -416,6 +420,63 @@ def test_refine_arm_twist_smplx_round_trip():
     _check_hinge_round_trip(m, rest, n_poses=15, seed=23)
 
 
+LEG_SIDES = ("left", "right")
+_LEG = {"left": ((23, 25, 27), (1, 4, 7)), "right": ((24, 26, 28), (2, 5, 8))}
+
+
+def _leg_world_smpl(P, rng):
+    w = _arm_world(P, rng)
+    for mp_idx, sm_idx in _LEG.values():
+        for mm, j in zip(mp_idx, sm_idx):
+            w[mm] = P[j]
+    return w
+
+
+def _check_leg_round_trip(m, rest, n_poses, seed):
+    """Plausible hip (thigh within 60 deg, twist within 50 deg) + knee hinge through smplx:
+    Increment A matches directions; Increment B also recovers the full hip rotation."""
+    rng = np.random.default_rng(seed)
+    worst_dir = worst_hip = 0.0
+    n_resolved = 0
+    for side in LEG_SIDES:
+        (_, (hp, kn, an)) = _LEG[side]
+        b1 = (rest[kn] - rest[hp]) / np.linalg.norm(rest[kn] - rest[hp])
+        h = knee_hinge_axis(rest, side)
+        for _ in range(n_poses):
+            go = rng.normal(size=3)
+            bp_true = rng.normal(scale=0.2, size=69)
+            ax = np.cross(b1, rng.normal(size=3))
+            target = axis_angle_to_rotation_matrix(np.radians(rng.uniform(0, 60)) * ax / np.linalg.norm(ax)) @ b1
+            R_hip = rotation_between_vectors(b1, target) @ axis_angle_to_rotation_matrix(
+                np.radians(rng.uniform(-50, 50)) * b1)
+            bp_true[3 * (hp - 1): 3 * hp] = rotation_matrix_to_axis_angle(R_hip)
+            bp_true[3 * (kn - 1): 3 * kn] = np.radians(rng.uniform(30, 120)) * h
+            P_true = smpl_forward(m, global_orient=go, body_pose=bp_true)["joints"][0].double().numpy()
+            start = bp_true.copy()
+            start[3 * (hp - 1): 3 * hp] = 0.0
+            start[3 * (kn - 1): 3 * kn] = 0.0
+            w = _leg_world_smpl(P_true, rng)
+            for fn in (init_leg_pose, refine_leg_twist):
+                bp, diag = fn(w, rest, go, side=side, body_pose=start)
+                P = smpl_forward(m, global_orient=go, body_pose=bp)["joints"][0].double().numpy()
+                for a, b in ((hp, kn), (kn, an)):
+                    worst_dir = max(worst_dir, _vec_angle_deg(P[b] - P[a], P_true[b] - P_true[a]))
+            if diag["twist_resolved"]:
+                n_resolved += 1
+                Rd = axis_angle_to_rotation_matrix(bp[3 * (hp - 1): 3 * hp]).T @ R_hip
+                worst_hip = max(worst_hip, float(np.degrees(np.linalg.norm(rotation_matrix_to_axis_angle(Rd)))))
+    assert worst_dir < 1e-3 and worst_hip < 1e-2 and n_resolved >= 0.8 * n_poses * len(LEG_SIDES), \
+        (worst_dir, worst_hip, n_resolved)
+    return worst_dir, worst_hip
+
+
+def test_leg_round_trip_smplx():
+    _need_deps()
+    m = _fixture()["model"]
+    rest = smpl_forward(m)["joints"][0].double().numpy()
+    _check_leg_round_trip(m, rest, n_poses=15, seed=25)
+
+
 # --------------------------------------------------------------------------- #
 # Real-model integration tests (optional)
 # --------------------------------------------------------------------------- #
@@ -499,6 +560,21 @@ def test_real_hinge_convention_and_round_trip():
         assert ahead > 0.10, f"{c}: thumb only {ahead:.3f} m ahead of pinky"
     worst_dir, worst_sh = _check_hinge_round_trip(m, rest, n_poses=20, seed=24)
     print(f"       (real model: worst direction error {worst_dir:.1e} deg, worst shoulder error {worst_sh:.1e} deg)")
+
+
+def test_real_leg_convention_and_round_trip():
+    m = _real_model()
+    rest = smpl_forward(m)["joints"][0].double().numpy()
+    fwd = smpl_rest_torso_orientation(m)[:, 2]
+    for side in LEG_SIDES:
+        (_, (hp, kn, an)) = _LEG[side]
+        assert knee_hinge_axis(rest, side)[0] > 0.95, f"{side}: knee hinge should be ~+x"
+        foot = SMPL_JOINT_NAMES.index(f"{side}_foot")
+        ahead = (rest[foot] - rest[an]) / np.linalg.norm(rest[foot] - rest[an]) @ fwd
+        assert ahead > 0.8, f"{side}: rest foot not pointing forward ({ahead:.2f})"
+    worst_dir, worst_hip = _check_leg_round_trip(m, rest, n_poses=20, seed=26)
+    print(f"       (real model legs {LEG_SIDES}: worst direction error {worst_dir:.1e} deg, "
+          f"worst hip error {worst_hip:.1e} deg)")
 
 
 if __name__ == "__main__":

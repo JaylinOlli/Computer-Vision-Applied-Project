@@ -30,7 +30,10 @@ from src.smpl_utils import (  # noqa: E402
     global_joint_rotations,
     global_orient_from_torso,
     init_arm_pose,
+    init_leg_pose,
+    knee_hinge_axis,
     refine_arm_twist,
+    refine_leg_twist,
     rotation_between_vectors,
     mediapipe_torso_orientation,
     rotation_angle_deg,
@@ -1016,6 +1019,262 @@ def test_refine_preserves_other_entries():
         others = np.setdiff1d(np.arange(69), sl)
         assert np.array_equal(bp[others], start[others])
         assert diag["twist_resolved"] and diag["phi_plausible"] is not None
+
+
+# --------------------------------------------------------------------------- #
+# Limb refactor: arm behaviour must stay bit-identical
+# --------------------------------------------------------------------------- #
+def test_arm_golden_regression():
+    """Arm outputs recorded BEFORE the shared-limb refactor (tests/golden/arm_golden.json)."""
+    import json
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden", "arm_golden.json")
+    with open(path) as fh:
+        cases = json.load(fh)["cases"]
+    clean = lambda d: {k: (list(v) if isinstance(v, tuple) else v) for k, v in d.items()}  # noqa: E731
+    assert len(cases) == 24
+    for i, c in enumerate(cases):
+        args = (np.array(c["world"]), np.array(c["rest"]), np.array(c["global_orient"]))
+        bpA, dA = init_arm_pose(*args, c["side"], np.array(c["body_pose"]))
+        bpB, dB = refine_arm_twist(*args, np.array(c["body_pose"]), c["side"])
+        assert np.array_equal(bpA, np.array(c["A"])), f"case {i}: Increment A body_pose changed"
+        assert np.array_equal(bpB, np.array(c["B"])), f"case {i}: Increment B body_pose changed"
+        assert clean(dA) == c["A_diag"], f"case {i}: Increment A diagnostics changed"
+        assert clean(dB) == c["B_diag"], f"case {i}: Increment B diagnostics changed"
+
+
+# --------------------------------------------------------------------------- #
+# Legs: swing-only (A) and hip twist + knee hinge (B)
+# --------------------------------------------------------------------------- #
+LEG = {"left": ((23, 25, 27), (1, 4, 7)), "right": ((24, 26, 28), (2, 5, 8))}
+LEG_SIDES = ("left", "right")
+
+
+def _leg_world(P, rng):
+    """MediaPipe-like world landmarks with both legs (and arms) on posed SMPL joints."""
+    w = _world_from_joints(P, rng)
+    for mp_idx, sm_idx in LEG.values():
+        for m, j in zip(mp_idx, sm_idx):
+            w[m] = P[j]
+    return w
+
+
+def _strip_leg(bp, side):
+    (_, (s_h, s_k, _)) = LEG[side]
+    out = bp.copy()
+    out[3 * (s_h - 1): 3 * s_h] = 0.0
+    out[3 * (s_k - 1): 3 * s_k] = 0.0
+    return out
+
+
+def _plausible_leg_pose(rng, side, phi_deg=None, twist_deg=None, rest=REST):
+    """Random pose: hip = swing (thigh within 60 deg of the rest thigh) @ twist about the rest thigh; knee hinge."""
+    (_, (s_h, s_k, _)) = LEG[side]
+    go = _unit(rng) * rng.uniform(0, np.pi)
+    bp = rng.normal(scale=0.2, size=69)
+    for k in (s_h, s_k):
+        bp[3 * (k - 1): 3 * k] = 0.0
+    b1 = _dir(rest[s_k] - rest[s_h])
+    swing_axis = _dir(np.cross(b1, rng.normal(size=3)))
+    target = axis_angle_to_rotation_matrix(np.radians(rng.uniform(0, 60)) * swing_axis) @ b1
+    tau = rng.uniform(-50, 50) if twist_deg is None else twist_deg
+    R_hip = rotation_between_vectors(b1, target) @ axis_angle_to_rotation_matrix(np.radians(tau) * b1)
+    bp[3 * (s_h - 1): 3 * s_h] = rotation_matrix_to_axis_angle(R_hip)
+    phi = rng.uniform(25, 120) if phi_deg is None else phi_deg
+    bp[3 * (s_k - 1): 3 * s_k] = np.radians(phi) * knee_hinge_axis(rest, side)
+    return go, bp, tau
+
+
+def _leg_bent_world(rng, side, beta_deg, go, sign=1.0, rest=REST):
+    """World whose thigh follows the rest thigh under global_orient and whose shin bends by
+    beta about the posed knee hinge axis (sign=+1 flexion, -1 hyperextension)."""
+    (mp_idx, (s_h, s_k, _)) = LEG[side]
+    Rg = axis_angle_to_rotation_matrix(go)
+    d1 = Rg @ _dir(rest[s_k] - rest[s_h])
+    d2 = axis_angle_to_rotation_matrix(sign * np.radians(beta_deg) * (Rg @ knee_hinge_axis(rest, side))) @ d1
+    w = rng.normal(scale=0.3, size=(33, 3))
+    w[mp_idx[1]] = w[mp_idx[0]] + 0.4 * d1
+    w[mp_idx[2]] = w[mp_idx[1]] + 0.4 * d2
+    return w
+
+
+def test_knee_hinge_axis_convention():
+    for side in LEG_SIDES:
+        (_, (s_h, s_k, _)) = LEG[side]
+        h = knee_hinge_axis(REST, side)
+        b1 = _dir(REST[s_k] - REST[s_h])
+        assert np.isclose(np.linalg.norm(h), 1.0) and abs(h @ b1) < 1e-12
+        assert h[0] > 0.95, f"{side}: knee hinge should point to +x for both legs: {h}"
+        # Positive rotation about h carries the thigh direction BACKWARD (-z).
+        assert (axis_angle_to_rotation_matrix(0.3 * h) @ b1)[2] < b1[2] - 0.1
+    _expect_raises(ValueError, lambda: knee_hinge_axis(REST, "middle"), "side")
+
+
+def test_leg_swing_round_trip_and_parent_frame():
+    rng = np.random.default_rng(40)
+    for side in LEG_SIDES:
+        (_, (s_h, s_k, s_a)) = LEG[side]
+        for _ in range(50):
+            go = _unit(rng) * rng.uniform(0, np.pi)
+            bp_true = rng.normal(scale=0.2, size=69)
+            bp_true[3 * (s_h - 1): 3 * s_h] = _unit(rng) * rng.uniform(0, 2.0)
+            bp_true[3 * (s_k - 1): 3 * s_k] = _unit(rng) * rng.uniform(0, 2.0)
+            P_true = _fk_positions(REST, global_joint_rotations(go, bp_true))
+            bp, diag = init_leg_pose(_leg_world(P_true, rng), REST, go, side, _strip_leg(bp_true, side))
+            P = _fk_positions(REST, global_joint_rotations(go, bp))
+            assert _vec_angle_deg(P[s_k] - P[s_h], P_true[s_k] - P_true[s_h]) < 1e-7, "thigh"
+            assert _vec_angle_deg(P[s_a] - P[s_k], P_true[s_a] - P_true[s_k]) < 1e-7, "shin"
+            sl = slice(3 * (s_h - 1), 3 * s_h)
+            twist = rotation_matrix_to_axis_angle(
+                axis_angle_to_rotation_matrix(bp[sl]).T @ axis_angle_to_rotation_matrix(bp_true[sl]))
+            if np.linalg.norm(twist) > 1e-9:
+                assert np.allclose(np.cross(_dir(twist), _dir(REST[s_k] - REST[s_h])), 0, atol=1e-7)
+            assert diag["hip_body_pose_slice"] == (3 * (s_h - 1), 3 * s_h)
+            assert diag["knee_body_pose_slice"] == (3 * (s_k - 1), 3 * s_k)
+        # The hip's parent is the pelvis: ignoring global_orient gives the wrong thigh.
+        go = np.array([-2.9454, -0.1423, 0.2281])
+        bp_true = np.zeros(69)
+        bp_true[3 * (s_h - 1): 3 * s_h] = [0.4, 0.1, -0.3]
+        P_true = _fk_positions(REST, global_joint_rotations(go, bp_true))
+        d = P_true[s_k] - P_true[s_h]
+        naive = np.zeros(69)
+        naive[3 * (s_h - 1): 3 * s_h] = rotation_matrix_to_axis_angle(
+            rotation_between_vectors(REST[s_k] - REST[s_h], d))
+        Pn = _fk_positions(REST, global_joint_rotations(go, naive))
+        assert _vec_angle_deg(Pn[s_k] - Pn[s_h], d) > 30.0
+
+
+def test_leg_refine_recovers_hinge_poses():
+    rng = np.random.default_rng(41)
+    for side in LEG_SIDES:
+        (_, (s_h, s_k, s_a)) = LEG[side]
+        n_ok = 0
+        for _ in range(150):
+            go, bp_true, tau = _plausible_leg_pose(rng, side)
+            P_true = _fk_positions(REST, global_joint_rotations(go, bp_true))
+            bp, diag = refine_leg_twist(_leg_world(P_true, rng), REST, go, _strip_leg(bp_true, side), side)
+            P = _fk_positions(REST, global_joint_rotations(go, bp))
+            assert _vec_angle_deg(P[s_k] - P[s_h], P_true[s_k] - P_true[s_h]) < 1e-7
+            assert _vec_angle_deg(P[s_a] - P[s_k], P_true[s_a] - P_true[s_k]) < 1e-7
+            if not diag["twist_resolved"]:
+                assert "straight" in diag["reason"], diag["reason"]  # only small bends may fall back
+                continue
+            n_ok += 1
+            sl = slice(3 * (s_h - 1), 3 * s_h)
+            assert _rot_deg(axis_angle_to_rotation_matrix(bp[sl]), axis_angle_to_rotation_matrix(bp_true[sl])) < 1e-6
+            assert np.allclose(bp[3 * (s_k - 1): 3 * s_k], bp_true[3 * (s_k - 1): 3 * s_k], atol=1e-9)
+            assert abs(diag["twist_deg"] - diag["psi_deg"]) < 1e-6, "swing-twist twist should equal psi"
+            assert abs(diag["twist_deg"] - tau) < 1e-6, "recovered hip twist differs from the truth"
+            assert diag["bend_direction_deg"] > 0, "a flexed knee should bend backward"
+        assert n_ok > 100, n_ok
+
+
+def test_leg_refine_arbitrary_knees_off_hinge_reduced():
+    rng = np.random.default_rng(42)
+    for side in LEG_SIDES:
+        (_, (s_h, s_k, s_a)) = LEG[side]
+        h = knee_hinge_axis(REST, side)
+        off_A, off_B = [], []
+        while len(off_B) < 60:
+            go, bp_true, _ = _plausible_leg_pose(rng, side)
+            bp_true[3 * (s_k - 1): 3 * s_k] = rotation_matrix_to_axis_angle(
+                axis_angle_to_rotation_matrix(bp_true[3 * (s_k - 1): 3 * s_k])
+                @ axis_angle_to_rotation_matrix(rng.normal(scale=0.3, size=3)))  # perturbed: NOT a hinge
+            P_true = _fk_positions(REST, global_joint_rotations(go, bp_true))
+            bp, diag = refine_leg_twist(_leg_world(P_true, rng), REST, go, None, side)
+            P = _fk_positions(REST, global_joint_rotations(go, bp))
+            assert _vec_angle_deg(P[s_k] - P[s_h], P_true[s_k] - P_true[s_h]) < 1e-7
+            assert _vec_angle_deg(P[s_a] - P[s_k], P_true[s_a] - P_true[s_k]) < 1e-7
+            if diag["twist_resolved"]:
+                assert np.linalg.norm(np.cross(bp[3 * (s_k - 1): 3 * s_k], h)) < 1e-12
+                off_A.append(diag["off_hinge_swing_only_deg"])
+                off_B.append(diag["off_hinge_deg"])
+        assert max(off_B) < 1e-9 and np.median(off_A) > 10.0, (np.median(off_A), max(off_B))
+
+
+def test_leg_thresholds_and_hyperextension():
+    rng = np.random.default_rng(43)
+    for side in LEG_SIDES:
+        go = np.array([0.1, -0.2, 0.05])
+        for beta, resolved in ((19.9, False), (20.1, True), (60.0, True)):
+            w = _leg_bent_world(rng, side, beta, go)
+            bp, diag = refine_leg_twist(w, REST, go, None, side)
+            assert diag["twist_resolved"] is resolved, (beta, diag["reason"])
+            assert abs(diag["bend_deg"] - beta) < 1e-9 and diag["bend_direction_deg"] > 0
+            if not resolved:
+                assert np.array_equal(bp, init_leg_pose(w, REST, go, side)[0]) and "straight" in diag["reason"]
+            else:
+                assert abs(diag["twist_deg"]) < 60.0
+        # Hyperextension (shin bowed forward): forcing flexion needs a ~180 deg hip twist -> guard.
+        w = _leg_bent_world(rng, side, 25.0, go, sign=-1.0)
+        bp, diag = refine_leg_twist(w, REST, go, None, side)
+        assert not diag["twist_resolved"] and "implausible hip twist" in diag["reason"], diag["reason"]
+        assert abs(diag["twist_deg"]) > 150.0 and diag["bend_direction_deg"] < 0
+        assert np.array_equal(bp, init_leg_pose(w, REST, go, side)[0])
+        # The guard is configurable.
+        _, d2 = refine_leg_twist(w, REST, go, None, side, max_hip_twist_deg=180.0)
+        assert d2["twist_resolved"]
+        _expect_raises(ValueError, lambda: refine_leg_twist(w, REST, go, straight_leg_deg=95.0), "straight_leg_deg")
+        _expect_raises(ValueError, lambda: refine_leg_twist(w, REST, go, max_hip_twist_deg=0.0), "max twist")
+
+
+def test_leg_mirror_symmetry():
+    # Mirror x -> -x with left/right swapped: same knee flexion, opposite hip twist.
+    M = np.diag([-1.0, 1.0, 1.0])
+    pairs = [(1, 2), (4, 5), (7, 8), (10, 11), (13, 14), (16, 17), (18, 19), (20, 21), (22, 23)]
+    swap = {i: i for i in range(24)}
+    for a, b in pairs:
+        swap[a], swap[b] = b, a
+    rest_sym = REST.copy()
+    for j in (2, 5, 8, 11, 14, 17, 19, 21, 23):
+        rest_sym[j] = M @ REST[swap[j]]
+    for j in (0, 3, 6, 9, 12, 15):
+        rest_sym[j, 0] = 0.0
+    assert np.allclose(knee_hinge_axis(rest_sym, "left"), knee_hinge_axis(rest_sym, "right") * [1, -1, -1])
+    rng = np.random.default_rng(45)
+    mp_swap = [23, 25, 27, 24, 26, 28]
+    for _ in range(20):
+        go, bp_true, _ = _plausible_leg_pose(rng, "left", rest=rest_sym)
+        P = _fk_positions(rest_sym, global_joint_rotations(go, bp_true))
+        w_left = _leg_world(P, rng)
+        w_right = w_left @ M.T
+        w_right[mp_swap] = (w_left @ M.T)[[24, 26, 28, 23, 25, 27]]
+        _, dl = refine_leg_twist(w_left, rest_sym, go, None, "left")
+        _, dr = refine_leg_twist(w_right, rest_sym, go * np.array([1.0, -1.0, -1.0]), None, "right")
+        assert dl["twist_resolved"] == dr["twist_resolved"]
+        if dl["twist_resolved"]:
+            assert abs(dl["phi_deg"] - dr["phi_deg"]) < 1e-7, (dl["phi_deg"], dr["phi_deg"])
+            assert abs(dl["twist_deg"] + dr["twist_deg"]) < 1e-7, (dl["twist_deg"], dr["twist_deg"])
+            assert abs(dl["bend_direction_deg"] - dr["bend_direction_deg"]) < 1e-7
+
+
+def test_leg_and_arm_independence():
+    rng = np.random.default_rng(44)
+    for side in LEG_SIDES:
+        (_, (s_h, s_k, _)) = LEG[side]
+        go, bp_true, _ = _plausible_leg_pose(rng, side)
+        bp_true[45:48] = [0.2, -0.1, -1.0]
+        bp_true[51:54] = 0.6 * elbow_hinge_axis(REST, "left")
+        P_true = _fk_positions(REST, global_joint_rotations(go, bp_true))
+        w = _leg_world(P_true, rng)
+        start = bp_true.copy()
+        start[[45, 46, 47, 51, 52, 53]] = 0.0
+        start = _strip_leg(start, side)
+        start_copy = start.copy()
+        arm_then_leg = refine_leg_twist(w, REST, go, refine_arm_twist(w, REST, go, start, "left")[0], side)[0]
+        leg_then_arm = refine_arm_twist(w, REST, go, refine_leg_twist(w, REST, go, start, side)[0], "left")[0]
+        assert np.array_equal(start, start_copy), "input modified in place"
+        assert np.allclose(arm_then_leg, leg_then_arm, atol=1e-12), "order dependence between arm and leg"
+        leg_sl = list(range(3 * (s_h - 1), 3 * s_h)) + list(range(3 * (s_k - 1), 3 * s_k))
+        only_leg = refine_leg_twist(w, REST, go, start, side)[0]
+        others = np.setdiff1d(np.arange(69), leg_sl)
+        assert np.array_equal(only_leg[others], start[others]), "leg init changed unrelated entries"
+        # Arm joint POSITIONS do not move when the leg is initialised (separate chains).
+        Pa = _fk_positions(REST, global_joint_rotations(go, start))
+        Pl = _fk_positions(REST, global_joint_rotations(go, only_leg))
+        n = SMPL_JOINT_NAMES.index
+        for j in ("left_shoulder", "left_elbow", "left_wrist", "right_wrist", "head"):
+            assert np.allclose(Pa[n(j)], Pl[n(j)], atol=1e-12), j
 
 
 if __name__ == "__main__":
