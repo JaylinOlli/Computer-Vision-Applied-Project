@@ -44,6 +44,7 @@ from src.smpl_utils import (  # noqa: E402
     global_orient_from_torso,
     init_arm_pose,
     init_leg_pose,
+    initialize_smpl_from_mediapipe,
     knee_hinge_axis,
     load_smpl,
     refine_arm_twist,
@@ -477,6 +478,44 @@ def test_leg_round_trip_smplx():
     _check_leg_round_trip(m, rest, n_poses=15, seed=25)
 
 
+def _check_full_body_smplx(m, rest, n_poses, seed):
+    """Full-body init through smplx: all 8 limb bones match; integrated == independent limb calls."""
+    rng = np.random.default_rng(seed)
+    bones = [(16, 18), (18, 20), (17, 19), (19, 21), (1, 4), (4, 7), (2, 5), (5, 8)]
+    worst = 0.0
+    for _ in range(n_poses):
+        go = rng.normal(size=3)
+        bp_true = np.zeros(69)  # spine/collars zero so the torso is rigid
+        for side, (s_, e_) in (("left", (16, 18)), ("right", (17, 19))):
+            bp_true[3 * (s_ - 1): 3 * s_] = rng.normal(size=3)
+            bp_true[3 * (e_ - 1): 3 * e_] = np.radians(rng.uniform(25, 120)) * elbow_hinge_axis(rest, side)
+        for side, (h_, k_) in (("left", (1, 4)), ("right", (2, 5))):
+            bp_true[3 * (h_ - 1): 3 * h_] = rng.normal(scale=0.4, size=3)
+            bp_true[3 * (k_ - 1): 3 * k_] = np.radians(rng.uniform(25, 120)) * knee_hinge_axis(rest, side)
+        P_true = smpl_forward(m, global_orient=go, body_pose=bp_true)["joints"][0].double().numpy()
+        w = _leg_world_smpl(P_true, rng)
+        out = initialize_smpl_from_mediapipe(w, rest)
+        P = smpl_forward(m, global_orient=out["global_orient"], body_pose=out["body_pose"])["joints"][0].double().numpy()
+        for a, b in bones:
+            worst = max(worst, _vec_angle_deg(P[b] - P[a], P_true[b] - P_true[a]))
+        # Same pose as running the limb initializers one by one.
+        bp = np.zeros(69)
+        bp, _ = refine_arm_twist(w, rest, out["global_orient"], body_pose=bp, side="left")
+        bp, _ = refine_arm_twist(w, rest, out["global_orient"], body_pose=bp, side="right")
+        bp, _ = refine_leg_twist(w, rest, out["global_orient"], body_pose=bp, side="left")
+        bp, _ = refine_leg_twist(w, rest, out["global_orient"], body_pose=bp, side="right")
+        assert np.array_equal(bp, out["body_pose"])
+    assert worst < 1e-3, f"worst bone-direction error {worst:.2e} deg"
+    return worst
+
+
+def test_full_body_smplx_round_trip():
+    _need_deps()
+    m = _fixture()["model"]
+    rest = smpl_forward(m)["joints"][0].double().numpy()
+    _check_full_body_smplx(m, rest, n_poses=10, seed=27)
+
+
 # --------------------------------------------------------------------------- #
 # Real-model integration tests (optional)
 # --------------------------------------------------------------------------- #
@@ -575,6 +614,13 @@ def test_real_leg_convention_and_round_trip():
     worst_dir, worst_hip = _check_leg_round_trip(m, rest, n_poses=20, seed=26)
     print(f"       (real model legs {LEG_SIDES}: worst direction error {worst_dir:.1e} deg, "
           f"worst hip error {worst_hip:.1e} deg)")
+
+
+def test_real_full_body_round_trip():
+    m = _real_model()
+    rest = smpl_forward(m)["joints"][0].double().numpy()
+    worst = _check_full_body_smplx(m, rest, n_poses=15, seed=28)
+    print(f"       (real model full body: worst limb bone-direction error {worst:.1e} deg)")
 
 
 if __name__ == "__main__":

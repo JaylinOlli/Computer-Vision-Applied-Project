@@ -1219,3 +1219,70 @@ def refine_leg_twist(world, rest_joints, global_orient, body_pose=None, side="le
     """
     return _refine_limb_twist("leg", world, rest_joints, global_orient, body_pose, side,
                               straight_leg_deg, "straight_leg_deg", max_hip_twist_deg, min_bone_length)
+
+
+# --------------------------------------------------------------------------- #
+# Full-body integration (Increment 1): global orientation + arms + legs
+# --------------------------------------------------------------------------- #
+FULL_BODY_LIMBS = (("arm", "left"), ("arm", "right"), ("leg", "left"), ("leg", "right"))
+
+
+def initialize_smpl_from_mediapipe(world, rest_joints, limbs=FULL_BODY_LIMBS, variant="twist",
+                                   straight_arm_deg=15.0, straight_leg_deg=20.0,
+                                   max_hip_twist_deg=60.0):
+    """
+    Full-body SMPL pose initialisation from MediaPipe world landmarks.
+
+    Integration only: this calls the existing, tested functions and adds no
+    rotation mathematics of its own.
+      1. global_orient = global_orient_from_torso(SMPL rest torso, MediaPipe torso).
+      2. body_pose starts as 69 zeros (23 non-root joints x 3).
+      3. Each limb in `limbs` is initialised in turn on that body_pose:
+           variant="twist": refine_arm_twist / refine_leg_twist (Increment B,
+                            falling back to swing-only where documented)
+           variant="swing": init_arm_pose / init_leg_pose (Increment A)
+         Each call writes only that limb's proximal and middle joints
+         (shoulder+elbow or hip+knee). Arms hang off the collars and legs off the
+         pelvis, and spine/collars stay zero, so the limb order does not matter.
+    Spine, collars, neck, head, wrists, hands, ankles and feet remain exactly zero.
+
+    Args:
+        world:       (33, 3) MediaPipe world landmarks (camera-aligned).
+        rest_joints: (24, 3) SMPL joints at zero pose (e.g. smpl_forward(model)["joints"][0]).
+        limbs:       sequence of (limb, side), limb in {"arm", "leg"}, side in {"left", "right"}.
+        variant:     "twist" (default) or "swing".
+        straight_arm_deg, straight_leg_deg, max_hip_twist_deg: passed to the
+                     twist refinements (ignored for variant="swing").
+
+    Returns:
+        dict with "global_orient" (3,), "body_pose" (69,), both float64, and
+        "limbs": {"<limb>_<side>": diagnostics from the limb function}.
+    """
+    if variant not in ("twist", "swing"):
+        raise ValueError(f"variant must be 'twist' or 'swing', got {variant!r}")
+    limbs = tuple(tuple(x) for x in limbs)
+    for item in limbs:
+        if len(item) != 2 or item[0] not in ("arm", "leg") or item[1] not in ("left", "right"):
+            raise ValueError(f"each limb must be (arm|leg, left|right), got {item!r}")
+    if len(set(limbs)) != len(limbs):
+        raise ValueError(f"duplicate limbs in {limbs}")
+
+    w = mediapipe_world_to_camera_aligned(world).astype(np.float64)
+    J = _check_rest_joints(rest_joints)
+    global_orient = global_orient_from_torso(smpl_torso_orientation_from_joints(J),
+                                             mediapipe_torso_orientation(w))
+    body_pose = np.zeros(3 * (NUM_SMPL_JOINTS - 1))
+    diagnostics = {}
+    for limb, side in limbs:
+        if variant == "swing":
+            fn = init_arm_pose if limb == "arm" else init_leg_pose
+            body_pose, diag = fn(w, J, global_orient, side=side, body_pose=body_pose)
+        elif limb == "arm":
+            body_pose, diag = refine_arm_twist(w, J, global_orient, body_pose=body_pose, side=side,
+                                               straight_arm_deg=straight_arm_deg)
+        else:
+            body_pose, diag = refine_leg_twist(w, J, global_orient, body_pose=body_pose, side=side,
+                                               straight_leg_deg=straight_leg_deg,
+                                               max_hip_twist_deg=max_hip_twist_deg)
+        diagnostics[f"{limb}_{side}"] = diag
+    return {"global_orient": global_orient, "body_pose": body_pose, "limbs": diagnostics}

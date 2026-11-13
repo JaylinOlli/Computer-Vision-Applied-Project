@@ -29,8 +29,10 @@ from src.smpl_utils import (  # noqa: E402
     elbow_hinge_axis,
     global_joint_rotations,
     global_orient_from_torso,
+    FULL_BODY_LIMBS,
     init_arm_pose,
     init_leg_pose,
+    initialize_smpl_from_mediapipe,
     knee_hinge_axis,
     refine_arm_twist,
     refine_leg_twist,
@@ -1019,6 +1021,129 @@ def test_refine_preserves_other_entries():
         others = np.setdiff1d(np.arange(69), sl)
         assert np.array_equal(bp[others], start[others])
         assert diag["twist_resolved"] and diag["phi_plausible"] is not None
+
+
+# --------------------------------------------------------------------------- #
+# Full-body integration (Increment 1)
+# --------------------------------------------------------------------------- #
+LIMB_SLOTS = {  # body_pose slots written per limb: (proximal joint, middle joint)
+    ("arm", "left"): (16, 18), ("arm", "right"): (17, 19), ("leg", "left"): (1, 4), ("leg", "right"): (2, 5)}
+
+
+def _full_body_truth(rng):
+    """Random full-body pose: spine/collars zero (torso rigid), hinge elbows/knees, plausible hips."""
+    go = _unit(rng) * rng.uniform(0, np.pi)
+    bp = np.zeros(69)
+    for side in ("left", "right"):
+        _, (s_s, s_e, _) = ARM[side]
+        bp[3 * (s_s - 1): 3 * s_s] = _unit(rng) * rng.uniform(0, 2.0)
+        bp[3 * (s_e - 1): 3 * s_e] = np.radians(rng.uniform(25, 120)) * elbow_hinge_axis(REST, side)
+        _, leg_bp, _ = _plausible_leg_pose(rng, side)
+        _, (h, k, _) = LEG[side]
+        for j in (h, k):
+            bp[3 * (j - 1): 3 * j] = leg_bp[3 * (j - 1): 3 * j]
+    return go, bp
+
+
+def _slots(limb_side):
+    return [i for j in LIMB_SLOTS[limb_side] for i in range(3 * (j - 1), 3 * j)]
+
+
+def test_full_body_matches_independent_initializers():
+    rng = np.random.default_rng(50)
+    for _ in range(30):
+        go_true, bp_true = _full_body_truth(rng)
+        w = _leg_world(_fk_positions(REST, global_joint_rotations(go_true, bp_true)), rng)
+        go = global_orient_from_torso(smpl_torso_orientation_from_joints(REST), mediapipe_torso_orientation(w))
+        for variant in ("twist", "swing"):
+            out = initialize_smpl_from_mediapipe(w, REST, variant=variant)
+            assert np.array_equal(out["global_orient"], go)
+            for limb, side in FULL_BODY_LIMBS:
+                if variant == "swing":
+                    fn = init_arm_pose if limb == "arm" else init_leg_pose
+                    bp_ind, d_ind = fn(w, REST, go, side=side)
+                else:
+                    fn = refine_arm_twist if limb == "arm" else refine_leg_twist
+                    bp_ind, d_ind = fn(w, REST, go, body_pose=None, side=side)
+                sl = _slots((limb, side))
+                assert np.array_equal(out["body_pose"][sl], bp_ind[sl]), (variant, limb, side)
+                assert out["limbs"][f"{limb}_{side}"] == d_ind, (variant, limb, side, "diagnostics")
+
+
+def test_full_body_slots_and_unimplemented_zero():
+    expected = {0, 1, 2, 3, 4, 5, 9, 10, 11, 12, 13, 14, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56}
+    n = SMPL_JOINT_NAMES.index
+    named = {i for name in ("left_hip", "right_hip", "left_knee", "right_knee", "left_shoulder",
+                            "right_shoulder", "left_elbow", "right_elbow")
+             for i in range(3 * (n(name) - 1), 3 * n(name))}
+    assert named == expected, "slot table disagrees with SMPL joint names"
+    rng = np.random.default_rng(51)
+    for _ in range(20):
+        go_true, bp_true = _full_body_truth(rng)
+        w = _leg_world(_fk_positions(REST, global_joint_rotations(go_true, bp_true)), rng)
+        for variant in ("twist", "swing"):
+            out = initialize_smpl_from_mediapipe(w, REST, variant=variant)
+            bp = out["body_pose"]
+            assert bp.shape == (69,) and bp.dtype == np.float64 and out["global_orient"].shape == (3,)
+            others = sorted(set(range(69)) - expected)
+            assert np.all(bp[others] == 0.0), "unimplemented joints must be exactly zero"
+            for limb_side in FULL_BODY_LIMBS:  # every written slot holds a real rotation
+                assert np.linalg.norm(bp[_slots(limb_side)]) > 0
+            diag = out["limbs"]
+            for limb, side in FULL_BODY_LIMBS:
+                prox, mid = ("shoulder", "elbow") if limb == "arm" else ("hip", "knee")
+                a, b = diag[f"{limb}_{side}"][f"{prox}_body_pose_slice"]
+                c, d = diag[f"{limb}_{side}"][f"{mid}_body_pose_slice"]
+                assert list(range(a, b)) + list(range(c, d)) == _slots((limb, side))
+
+
+def test_full_body_order_independent():
+    import itertools
+
+    rng = np.random.default_rng(52)
+    go_true, bp_true = _full_body_truth(rng)
+    w = _leg_world(_fk_positions(REST, global_joint_rotations(go_true, bp_true)), rng)
+    for variant in ("twist", "swing"):
+        ref = initialize_smpl_from_mediapipe(w, REST, variant=variant)
+        for order in itertools.permutations(FULL_BODY_LIMBS):
+            out = initialize_smpl_from_mediapipe(w, REST, limbs=order, variant=variant)
+            assert np.array_equal(out["body_pose"], ref["body_pose"]), (variant, order)
+            assert out["limbs"] == ref["limbs"]
+
+
+def test_full_body_round_trip():
+    rng = np.random.default_rng(53)
+    n_exact = 0
+    for _ in range(60):
+        go_true, bp_true = _full_body_truth(rng)
+        P_true = _fk_positions(REST, global_joint_rotations(go_true, bp_true))
+        out = initialize_smpl_from_mediapipe(_leg_world(P_true, rng), REST)
+        assert _rot_deg(axis_angle_to_rotation_matrix(out["global_orient"]),
+                        axis_angle_to_rotation_matrix(go_true)) < 1e-7, "global_orient"
+        P = _fk_positions(REST, global_joint_rotations(out["global_orient"], out["body_pose"]))
+        for (_, (a, b, c)) in list(ARM.values()) + list(LEG.values()):
+            assert _vec_angle_deg(P[b] - P[a], P_true[b] - P_true[a]) < 1e-7
+            assert _vec_angle_deg(P[c] - P[b], P_true[c] - P_true[b]) < 1e-7
+        if all(d["twist_resolved"] for d in out["limbs"].values()):
+            n_exact += 1  # hinge truth + resolved twist -> the whole pose is recovered
+            assert np.allclose(out["body_pose"], bp_true, atol=1e-7)
+    assert n_exact > 30, n_exact
+
+
+def test_full_body_subsets_and_validation():
+    rng = np.random.default_rng(54)
+    go_true, bp_true = _full_body_truth(rng)
+    w = _leg_world(_fk_positions(REST, global_joint_rotations(go_true, bp_true)), rng)
+    out = initialize_smpl_from_mediapipe(w, REST, limbs=[("leg", "left")])
+    assert set(np.flatnonzero(out["body_pose"])) <= set(_slots(("leg", "left")))
+    assert list(out["limbs"]) == ["leg_left"]
+    assert not np.any(initialize_smpl_from_mediapipe(w, REST, limbs=())["body_pose"])
+    # Thresholds are passed through: a huge straight-leg threshold forces the swing-only fallback.
+    forced = initialize_smpl_from_mediapipe(w, REST, straight_leg_deg=89.0)
+    assert not forced["limbs"]["leg_left"]["twist_resolved"]
+    for bad, match in (({"variant": "hinge"}, "variant"), ({"limbs": [("arm", "middle")]}, "limb"),
+                       ({"limbs": [("tail", "left")]}, "limb"), ({"limbs": [("arm", "left")] * 2}, "duplicate")):
+        _expect_raises(ValueError, lambda b=bad: initialize_smpl_from_mediapipe(w, REST, **b), match)
 
 
 # --------------------------------------------------------------------------- #
