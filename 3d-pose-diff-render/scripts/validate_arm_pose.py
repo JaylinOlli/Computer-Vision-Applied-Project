@@ -163,8 +163,15 @@ def analyze(world, vis, model, limbs):
     return metrics, arrays
 
 
-def save_3d(arrays, metrics, limbs, path):
+def build_figure(arrays, metrics, limbs, show_mesh=None):
+    """
+    Interactive Plotly figure (dropdown: both / swing-only A / twist-corrected B).
+    show_mesh: None (meshes hidden, toggle via legend), "A" or "B" (that mesh shown initially).
+    """
     import plotly.graph_objects as go
+
+    if show_mesh not in (None, "A", "B"):
+        raise ValueError(f"show_mesh must be None, 'A' or 'B', got {show_mesh!r}")
 
     world, J, V, F = arrays["world"], arrays["J"], arrays["V"], arrays["faces"]
     mp = world - _hip_mid(world, 23, 24)
@@ -236,8 +243,8 @@ def save_3d(arrays, metrics, limbs, path):
                 out.append("legendonly" if mode in (g[-1], "both") else False)
         return out
 
-    for t, v in zip(traces, vis_for("both")):
-        t.visible = v
+    for t, v, g in zip(traces, vis_for("both"), groups):
+        t.visible = True if (show_mesh is not None and g == f"mesh{show_mesh}") else v
     buttons = [dict(label=lbl, method="update", args=[{"visible": vis_for(mode)}])
                for lbl, mode in (("Both", "both"), ("Swing-only (A)", "A"), ("Twist-corrected (B)", "B"))]
     parts = []
@@ -256,7 +263,11 @@ def save_3d(arrays, metrics, limbs, path):
                    aspectmode="data", camera=dict(up=dict(x=0, y=-1, z=0), eye=dict(x=0.0, y=-0.3, z=-2.2))),
         legend=dict(itemsizing="constant"), margin=dict(l=0, r=0, t=90, b=0),
     )
-    fig.write_html(path, include_plotlyjs=True)
+    return fig
+
+
+def save_3d(arrays, metrics, limbs, path):
+    build_figure(arrays, metrics, limbs).write_html(path, include_plotlyjs=True)
 
 
 def main(argv=None):

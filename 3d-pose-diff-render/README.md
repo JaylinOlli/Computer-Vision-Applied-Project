@@ -107,6 +107,16 @@ wget -O ~/models/mediapipe/pose_landmarker_heavy.task \
 The real-model checks in `test_smpl_model.py` are reported as `[skip]` unless `SMPL_MODEL_PATH` is set.
 With the model available, the suites currently report 67/67 (`test_smpl_utils.py`) and 25/25 (`test_smpl_model.py`).
 
+## Interactive notebook (`notebooks/smpl_mapping.ipynb`)
+
+Runs the current initialization (global orientation, arms, legs; A vs B) on any photograph, with a landmark overlay, metric tables and an interactive 3D view (optional SMPL mesh). It only calls `src/smpl_utils.py` and the validation-script helpers.
+
+```bash
+.venv/bin/pip install ipykernel nbformat   # VS Code kernel + inline Plotly
+```
+
+In VS Code choose **Select Kernel -> Python Environments -> `.venv/bin/python`**. Set `IMAGE_PATH`, `SMPL_MODEL_PATH` and optionally `LIMBS`, `SIDES` and `SHOW_MESH` in the first code cell. You can also set the `MP_IMAGE_PATH` / `SMPL_MODEL_PATH` environment variables before starting VS Code. Then use **Run All**. To try another photo, change `IMAGE_PATH` and rerun from that cell; SMPL stays cached. Saving outputs is off by default (`SAVE_OUTPUTS`), and the output folder must be outside the repository.
+
 ## Real-image validation
 
 Both scripts run MediaPipe on one photo, fit SMPL, and write their results to `--out-dir`. That directory must be outside the repository.

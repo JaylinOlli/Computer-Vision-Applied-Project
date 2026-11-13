@@ -195,7 +195,8 @@ def analyze(result, image_hw, model, R_rest):
 # --------------------------------------------------------------------------- #
 # Visualisation
 # --------------------------------------------------------------------------- #
-def save_overlay(rgb, arrays, path):
+def draw_overlay(rgb, arrays):
+    """Return a BGR copy of the photo with the 33 landmarks (green: visible, red: low visibility)."""
     import cv2
 
     img = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR).copy()
@@ -211,7 +212,13 @@ def save_overlay(rgb, arrays, path):
         org = (int(px[i, 0]) + 5 * s, int(px[i, 1]) - 5 * s)
         cv2.putText(img, label, org, cv2.FONT_HERSHEY_SIMPLEX, 0.5 * s, (0, 0, 0), 3 * s, cv2.LINE_AA)
         cv2.putText(img, label, org, cv2.FONT_HERSHEY_SIMPLEX, 0.5 * s, (255, 255, 0), s, cv2.LINE_AA)
-    cv2.imwrite(path, img)
+    return img
+
+
+def save_overlay(rgb, arrays, path):
+    import cv2
+
+    cv2.imwrite(path, draw_overlay(rgb, arrays))
 
 
 def save_3d(arrays, metrics, path, title):
