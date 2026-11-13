@@ -2,8 +2,8 @@
 Real-image validation of limb initialisation: swing-only (Increment A) vs
 twist-corrected with a pure-hinge elbow / knee (Increment B), for arms, legs or all.
 
-    photo -> MediaPipe -> global_orient (torso)
-          -> init_{arm,leg}_pose (A) / refine_{arm,leg}_twist (B) -> SMPL
+    photo -> MediaPipe -> initialize_smpl_from_mediapipe (global_orient + limbs;
+             variant "swing" = A, variant "twist" = B) -> SMPL
 
 betas = transl = 0; only the selected limbs' proximal/middle joints of
 body_pose are set (all other joints stay at zero). For legs, the foot
@@ -39,18 +39,13 @@ from src.smpl_utils import (  # noqa: E402
     SMPL_PARENTS,
     elbow_hinge_axis,
     global_joint_rotations,
-    global_orient_from_torso,
-    init_arm_pose,
-    init_leg_pose,
+    initialize_smpl_from_mediapipe,
     knee_hinge_axis,
     load_smpl,
     mediapipe_to_arrays,
     mediapipe_torso_orientation,
     mediapipe_world_to_camera_aligned,
-    refine_arm_twist,
-    refine_leg_twist,
     smpl_forward,
-    smpl_rest_torso_orientation,
 )
 from validate_global_orient import DEFAULT_POSE_MODEL, MP_CONNECTIONS, detect_pose, read_rgb  # noqa: E402
 
@@ -63,13 +58,7 @@ INDICES = {
     ("leg", "left"): ((23, 25, 27), (1, 4, 7)), ("leg", "right"): ((24, 26, 28), (2, 5, 8)),
 }
 FOOT = {"left": ((29, 31), (7, 10)), "right": ((30, 32), (8, 11))}  # MediaPipe heel->toe, SMPL ankle->foot
-SOLVERS = {
-    "arm": (init_arm_pose, lambda w, J, go, bp, side: refine_arm_twist(
-        w, J, go, body_pose=bp, side=side, straight_arm_deg=STRAIGHT_ARM_DEG), elbow_hinge_axis),
-    "leg": (init_leg_pose, lambda w, J, go, bp, side: refine_leg_twist(
-        w, J, go, body_pose=bp, side=side, straight_leg_deg=STRAIGHT_LEG_DEG,
-        max_hip_twist_deg=MAX_HIP_TWIST_DEG), knee_hinge_axis),
-}
+HINGE_AXIS = {"arm": elbow_hinge_axis, "leg": knee_hinge_axis}
 
 
 def _angle(u, v):
@@ -81,13 +70,39 @@ def _hip_mid(P, left, right):
     return 0.5 * (P[left] + P[right])
 
 
+def initialize_poses(world, rest, limbs):
+    """Full-body poses from initialize_smpl_from_mediapipe: "A" swing-only, "B" twist + hinge."""
+    return {
+        "A": initialize_smpl_from_mediapipe(world, rest, limbs=limbs, variant="swing"),
+        "B": initialize_smpl_from_mediapipe(world, rest, limbs=limbs, variant="twist",
+                                            straight_arm_deg=STRAIGHT_ARM_DEG, straight_leg_deg=STRAIGHT_LEG_DEG,
+                                            max_hip_twist_deg=MAX_HIP_TWIST_DEG),
+    }
+
+
 def analyze(world, vis, model, limbs):
     """limbs: list of (limb, side) with limb in {"arm", "leg"}."""
     import torch
 
-    R_rest = smpl_rest_torso_orientation(model)
+    with torch.no_grad():
+        rest = smpl_forward(model)["joints"][0].double().numpy()
+    return analyze_initialization(world, vis, model, limbs, initialize_poses(world, rest, limbs), rest)
+
+
+def analyze_initialization(world, vis, model, limbs, poses, rest):
+    """
+    Metrics and plot data for poses from initialize_smpl_from_mediapipe().
+
+    poses: {"A": swing-only result, "B": twist result}, each a dict with
+           "global_orient", "body_pose" and per-limb "limbs" diagnostics.
+    rest:  (24, 3) SMPL rest joints used to compute the poses.
+    """
+    import torch
+
     R_mp = mediapipe_torso_orientation(world)
-    go = global_orient_from_torso(R_rest, R_mp)
+    go = poses["B"]["global_orient"]
+    if not np.array_equal(poses["A"]["global_orient"], go):
+        raise ValueError("poses A and B must share the same global_orient")
 
     def foot_yaw_pitch(v):
         """Foot direction in the body frame: yaw (+ toward the person's left) and pitch (+ toes up)."""
@@ -95,15 +110,9 @@ def analyze(world, vis, model, limbs):
         hz = v - (v @ R_mp[:, 1]) * R_mp[:, 1]
         return (float(np.degrees(np.arctan2(hz @ R_mp[:, 0], hz @ R_mp[:, 2]))),
                 float(np.degrees(np.arcsin(np.clip(v @ R_mp[:, 1], -1.0, 1.0)))))
-    with torch.no_grad():
-        rest = smpl_forward(model)["joints"][0].double().numpy()
-    bp = {"A": np.zeros(69), "B": np.zeros(69)}
-    diag = {}
-    for limb, side in limbs:
-        init_fn, refine_fn, _ = SOLVERS[limb]
-        bp["A"], dA = init_fn(world, rest, go, side=side, body_pose=bp["A"])
-        bp["B"], dB = refine_fn(world, rest, go, bp["B"], side)
-        diag[(limb, side)] = (dA, dB)
+    bp = {k: poses[k]["body_pose"] for k in ("A", "B")}
+    diag = {(limb, side): (poses["A"]["limbs"][f"{limb}_{side}"], poses["B"]["limbs"][f"{limb}_{side}"])
+            for limb, side in limbs}
 
     J, V = {}, {}
     with torch.no_grad():
@@ -120,7 +129,7 @@ def analyze(world, vis, model, limbs):
         (m_s, m_e, m_w), (s_s, s_e, s_w) = INDICES[(limb, side)]
         dA, dB = diag[(limb, side)]
         d_up, d_fo = world[m_e] - world[m_s], world[m_w] - world[m_e]
-        h = SOLVERS[limb][2](rest, side)
+        h = HINGE_AXIS[limb](rest, side)
         per = {}
         for k in ("A", "B"):
             Jk = J[k]
