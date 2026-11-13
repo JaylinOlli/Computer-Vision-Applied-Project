@@ -29,3 +29,76 @@ How many optimization iterations are needed to achieve meaningful improvement?
 Does the refined pose consistently outperform the original MediaPipe pose? 
 What loss function produces the best pose refinement? 
 Application: Can we use differentiable rendering to estimate an athlete’s 3D running, jumping, or lifting mechanics from ordinary video or photos, and refine the pose to improve biomechanical analysis?
+
+
+## Implementation status
+
+### Done: MediaPipe-to-SMPL initialization (`src/smpl_utils.py`)
+- **Correspondences and extraction:** MediaPipe 33-landmark to SMPL 24-joint table; `mediapipe_to_arrays()` reads world landmarks, pixels and visibility from either the legacy Solutions or the Tasks API result.
+- **Coordinate convention:** MediaPipe world landmarks are treated as camera-aligned (OpenCV: +X right, +Y down, +Z forward, meters). SMPL's different rest orientation is handled by `global_orient`, never by flipping axes.
+- **Global orientation:** `torso_orientation_matrix()` builds a right-handed torso frame from the shoulders and hips; `global_orient_from_torso()` returns SMPL `global_orient` (axis-angle) that maps the SMPL rest torso onto the MediaPipe torso.
+- **SMPL forward model:** `load_smpl()` loads a Chumpy-free SMPL model (smplx), `smpl_forward()` returns vertices, 24 joints and faces with gradients preserved, and `smpl_rest_torso_orientation()` computes the rest-pose torso frame.
+- **Arm `body_pose`, Increment A:** `init_arm_pose()` sets the shoulder and elbow to the minimal (swing-only) rotations that match the observed upper-arm and forearm directions.
+- **Arm `body_pose`, Increment B:** `refine_arm_twist()` treats the elbow as a pure hinge about `elbow_hinge_axis()` and solves for shoulder twist from the elbow bend plane. Nearly straight arms (< 15 deg bend) fall back to Increment A.
+
+### Not done yet
+- Leg initialization (hips, knees, ankles)
+- Full-body `body_pose` initialization (spine, collar, neck, head, feet, hands are zero)
+- Shape (`betas`) and camera translation estimation
+- Differentiable-rendering refinement on SMPL, 3DPW loading (`src/data_loader.py`) and metrics (`src/metrics.py`)
+
+## Setup
+
+Run all commands from `3d-pose-diff-render/`. Python 3.10 has been tested.
+
+```bash
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+PyTorch3D is only needed for `src/rendering.py` and its test. It is usually installed in Colab.
+
+### Model files (not in the repository)
+Licensed and large binaries are gitignored (`*.pkl`, `*.npz`, `*.task`, `data/`). Do not commit them.
+
+**SMPL:** Register at https://smpl.is.tue.mpg.de and download *SMPL for Python*. The official pickles reference `chumpy`, so convert them once to plain NumPy arrays. For example, use `tools/clean_ch.py` from the [smplx repository](https://github.com/vchoutas/smplx) in a separate environment that has `chumpy` installed. Then pass the cleaned file by path or through an environment variable:
+
+```bash
+export SMPL_MODEL_PATH=/path/to/smpl_models_clean/SMPL_NEUTRAL.pkl
+```
+
+`load_smpl()` accepts either a `.pkl` file or a directory that contains `SMPL_{NEUTRAL,MALE,FEMALE}.pkl`.
+
+**MediaPipe Pose Landmarker:** The validation scripts look for the model at `~/models/mediapipe/pose_landmarker_heavy.task` by default. You can override this with `--pose-model`.
+
+```bash
+mkdir -p ~/models/mediapipe
+wget -O ~/models/mediapipe/pose_landmarker_heavy.task \
+  https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task
+```
+
+## Tests
+
+```bash
+.venv/bin/python tests/test_smpl_utils.py   # NumPy only; no model files needed
+.venv/bin/python tests/test_smpl_model.py   # torch + smplx; uses a synthetic SMPL-format model
+.venv/bin/python tests/test_rendering.py    # requires PyTorch3D (e.g. Colab)
+```
+
+The real-model checks in `test_smpl_model.py` are reported as `[skip]` unless `SMPL_MODEL_PATH` is set.
+
+## Real-image validation
+
+Both scripts run MediaPipe on one photo, fit SMPL, and write their results to `--out-dir`. That directory must be outside the repository.
+
+```bash
+# Global orientation: metrics.json, landmarks_2d.png, orientation_3d.html
+.venv/bin/python scripts/validate_global_orient.py --image photo.jpg \
+    --smpl-model "$SMPL_MODEL_PATH" --out-dir ~/cv_outputs/orient [--mirror]
+
+# Arm pose, Increment A vs B: arm_metrics_<side>.json, arm_pose_3d_<side>.html
+.venv/bin/python scripts/validate_arm_pose.py --image photo.jpg \
+    --smpl-model "$SMPL_MODEL_PATH" --out-dir ~/cv_outputs/arm_pose [--side left|right|both]
+```
+
+The `.html` files are self-contained interactive Plotly views. Open them in any browser, for example with `xdg-open ~/cv_outputs/orient/orientation_3d.html`. On WSL, use `explorer.exe` with a Windows path. You can rotate and zoom the view and toggle individual traces. The arm view has an A / B / both dropdown, SMPL meshes and elbow hinge-axis arrows.
